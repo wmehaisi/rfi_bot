@@ -1,7 +1,12 @@
 services:
   - type: web
-    name: rfi_bot
-    env: python
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python bot.py"
-    runtime: "python3"
+    name: rfi-bot
+    env: docker
+    repo: https://github.com/wmehaisi/rfi_bot
+    plan: free
+    branch: main
+    buildCommand: ""
+    startCommand: ""
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
