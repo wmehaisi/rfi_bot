@@ -1,19 +1,27 @@
 import os
 import re
-import pdfplumber
 import tempfile
+import pdfplumber
 import openpyxl
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputFile,
+)
 from telegram.ext import (
-    ApplicationBuilder,
-    ContextTypes,
+    Updater,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
-    filters,
+    Filters,
+    CallbackContext,
 )
 
-# BOT TOKEN WILL COME FROM RENDER ENV VARIABLE
+# =========================
+# CONFIG
+# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 START_ROW = 866
@@ -22,45 +30,52 @@ FIXED_PROJECT_NO = "4400021143"
 FIXED_CLASSIFICATION = "OHTL"
 FIXED_DISCIPLINE = "Civil"
 
-# USER TEMP STORAGE
-USERS = {}
+# user data in memory
+USERS = {}  # user_id -> dict(tmpdir, excel_path, pdfs, preview, generated)
 
-def ensure_user(uid):
-    if uid not in USERS:
-        tmp = tempfile.mkdtemp(prefix=f"user_{uid}_")
-        USERS[uid] = {
+
+def ensure_user(user_id: int):
+    if user_id not in USERS:
+        tmp = tempfile.mkdtemp(prefix=f"user_{user_id}_")
+        USERS[user_id] = {
             "tmpdir": tmp,
             "excel_path": None,
             "pdfs": [],
             "preview": [],
             "generated": None,
         }
-    return USERS[uid]
+    return USERS[user_id]
 
-# PDF TEXT EXTRACTION
-def extract_text_from_pdf(path):
+
+# =========================
+# PDF HELPERS
+# =========================
+def extract_text_from_pdf(path: str) -> str:
     text = ""
     with pdfplumber.open(path) as pdf:
         for p in pdf.pages:
             text += p.extract_text() or ""
     return text
 
-# PARSE PDF CONTENT
-def parse_pdf(path):
+
+def parse_pdf(path: str):
     base = os.path.basename(path)
-    rfi = re.search(r"(\d{1,6})", base)
-    rfi_num = rfi.group(1) if rfi else ""
+    m = re.search(r"(\d{1,6})", base)
+    rfi_num = m.group(1) if m else ""
 
     txt = " ".join(extract_text_from_pdf(path).split())
 
-    drawing = re.search(r"([A-Z]{1,6}-\d{2,7})", txt)
-    drawing = drawing.group(1) if drawing else ""
+    # drawing number like CA-1581064
+    dm = re.search(r"([A-Z]{1,6}-\d{2,7})", txt)
+    drawing = dm.group(1) if dm else ""
 
+    # description
     desc = ""
-    d = re.search(r"(Inspection Request for[^\n]{5,120})", txt)
-    if d:
-        desc = d.group(1).strip()
+    d1 = re.search(r"(Inspection Request for[^\n]{5,120})", txt)
+    if d1:
+        desc = d1.group(1).strip()
 
+    # date like 02-Nov-25 or 02 Nov 2025
     date = ""
     dt = re.search(
         r"(\d{1,2}[-/ ](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[-/ ]\d{2,4})",
@@ -77,24 +92,28 @@ def parse_pdf(path):
         "date": date,
     }
 
-# UPDATE EXCEL FILE
-def update_excel(template, out_path, rows):
-    wb = openpyxl.load_workbook(template)
+
+# =========================
+# EXCEL HELPER
+# =========================
+def update_excel(template_path: str, out_path: str, rows):
+    wb = openpyxl.load_workbook(template_path)
     ws = wb.active
 
+    # insert new rows to keep formatting below
     ws.insert_rows(START_ROW, len(rows))
 
     for i, r in enumerate(rows):
         row = START_ROW + i
 
-        def sc(c, v):
-            ws[f"{c}{row}"].value = v
+        def sc(col_letter, value):
+            ws["%s%d" % (col_letter, row)].value = value
 
-        sc("C", f"IRFI-C-{r['rfi']}")
+        sc("C", "IRFI-C-%s" % r["rfi"])
         sc("D", FIXED_PROJECT_NO)
         sc("E", FIXED_CLASSIFICATION)
         sc("F", FIXED_DISCIPLINE)
-        sc("G", f"RFI-C-{r['rfi']}")
+        sc("G", "RFI-C-%s" % r["rfi"])
         sc("H", r["description"])
         sc("I", r["drawing"])
         sc("J", r["date"])
@@ -103,78 +122,111 @@ def update_excel(template, out_path, rows):
     wb.save(out_path)
     return out_path
 
-# TELEGRAM HANDLERS
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+
+# =========================
+# TELEGRAM HANDLERS (SYNC)
+# =========================
+def start(update: Update, context: CallbackContext):
     ensure_user(update.effective_user.id)
-    await update.message.reply_text(
-        "👋 Welcome!\nSend your Excel file first, then upload the PDF files."
+    update.message.reply_text(
+        "👋 Welcome!\n"
+        "1️⃣ Send the Excel file (.xlsx)\n"
+        "2️⃣ Then send one or more PDF RFI files.\n"
+        "When both are uploaded, I will show buttons to preview and generate."
     )
 
-async def handle_docs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    u = ensure_user(update.effective_user.id)
+
+def handle_docs(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    u = ensure_user(user_id)
+
     doc = update.message.document
-    f = await doc.get_file()
+    if not doc:
+        return
 
+    file = context.bot.get_file(doc.file_id)
     dest = os.path.join(u["tmpdir"], doc.file_name)
-    await f.download_to_drive(dest)
+    file.download(dest)
 
-    if dest.endswith(".xlsx"):
+    if dest.lower().endswith(".xlsx"):
         u["excel_path"] = dest
-        await update.message.reply_text("📘 Excel uploaded.")
-    elif dest.endswith(".pdf"):
+        update.message.reply_text("📘 Excel template uploaded.")
+    elif dest.lower().endswith(".pdf"):
         u["pdfs"].append(dest)
-        await update.message.reply_text("📄 PDF uploaded.")
+        update.message.reply_text("📄 PDF uploaded.")
     else:
-        await update.message.reply_text("❌ Only PDF and Excel files are supported.")
+        update.message.reply_text("❌ Only .xlsx and .pdf files are supported.")
         return
 
     if u["excel_path"] and u["pdfs"]:
-        kb = [
+        keyboard = [
             [InlineKeyboardButton("Preview", callback_data="preview")],
             [InlineKeyboardButton("Generate Excel", callback_data="generate")],
             [InlineKeyboardButton("Download Excel", callback_data="download")],
         ]
-        await update.message.reply_text(
-            "Choose action:", reply_markup=InlineKeyboardMarkup(kb)
+        update.message.reply_text(
+            "✅ Files ready. Choose an action:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
         )
 
-async def buttons(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
 
-    u = ensure_user(q.from_user.id)
+def button_callback(update: Update, context: CallbackContext):
+    query = update.callback_query
+    user_id = query.from_user.id
+    u = ensure_user(user_id)
 
-    if q.data == "preview":
+    data = query.data
+
+    if data == "preview":
+        # parse PDFs
         u["preview"] = [parse_pdf(p) for p in u["pdfs"]]
-        txt = "\n".join(
-            [
-                f"Row {START_ROW+i}: RFI={r['rfi']} | {r['description'][:40]}"
-                for i, r in enumerate(u["preview"])
-            ]
-        )
-        await q.edit_message_text("🔍 Preview:\n" + txt)
+        lines = []
+        for i, r in enumerate(u["preview"]):
+            line = "Row %d: RFI=%s | %s" % (
+                START_ROW + i,
+                r["rfi"],
+                (r["description"] or "")[:60],
+            )
+            lines.append(line)
+        text = "🔍 Preview of rows to be written:\n\n" + "\n".join(lines)
+        query.edit_message_text(text)
 
-    elif q.data == "generate":
+    elif data == "generate":
+        if not u.get("preview"):
+            u["preview"] = [parse_pdf(p) for p in u["pdfs"]]
         out_path = os.path.join(u["tmpdir"], "updated.xlsx")
         update_excel(u["excel_path"], out_path, u["preview"])
         u["generated"] = out_path
-        await q.edit_message_text("✅ Excel generated successfully!")
+        query.edit_message_text("✅ Excel generated. Use 'Download Excel' to get it.")
 
-    elif q.data == "download":
-        if not u["generated"]:
-            await q.edit_message_text("❌ Please generate the Excel first.")
+    elif data == "download":
+        if not u.get("generated"):
+            query.edit_message_text("❌ Please generate the Excel file first.")
             return
-
         with open(u["generated"], "rb") as f:
-            await q.message.reply_document(InputFile(f, "updated.xlsx"))
+            context.bot.send_document(
+                chat_id=query.message.chat_id,
+                document=InputFile(f, filename="updated.xlsx"),
+            )
+        query.edit_message_text("📤 File sent.")
 
-        await q.edit_message_text("📤 File sent successfully!")
 
-# START BOT
-app = ApplicationBuilder().token(BOT_TOKEN).build()
+def main():
+    token = BOT_TOKEN
+    if not token:
+        raise RuntimeError("BOT_TOKEN environment variable is not set.")
 
-app.add_handler(CommandHandler("start", start))
-app.add_handler(MessageHandler(filters.Document.ALL, handle_docs))
-app.add_handler(CallbackQueryHandler(buttons))
+    updater = Updater(token=token, use_context=True)
+    dp = updater.dispatcher
 
-app.run_polling()
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(MessageHandler(Filters.document, handle_docs))
+    dp.add_handler(CallbackQueryHandler(button_callback))
+
+    # long polling
+    updater.start_polling()
+    updater.idle()
+
+
+if __name__ == "__main__":
+    main()
