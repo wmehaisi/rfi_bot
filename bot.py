@@ -11,7 +11,7 @@ bot = Bot(token=BOT_TOKEN)
 
 app = Flask(__name__)
 
-# Permanent Render-safe directory
+# Permanent directory on Render
 UPLOAD_DIR = "/data"
 if not os.path.exists(UPLOAD_DIR):
     os.makedirs(UPLOAD_DIR)
@@ -28,36 +28,55 @@ def start(update, context):
     )
 
 
+# ---------------------------
+# FIXED EXCEL FILE HANDLER
+# ---------------------------
 def handle_excel(update, context):
     file = update.message.document
+    file_name = file.file_name.lower()
 
-    if not file.file_name.endswith(".xlsx"):
+    # Accept ALL Excel MIME types coming from Telegram
+    allowed_excel = [
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/octet-stream",
+        "application/vnd.ms-excel",
+    ]
+
+    if file.mime_type not in allowed_excel or not file_name.endswith(".xlsx"):
         update.message.reply_text("❌ Please upload a valid Excel (.xlsx) file.")
         return
 
-    # Save Excel permanently (this directory survives restarts!)
-    file_path = EXCEL_FILE
-    file.get_file().download(file_path)
-
+    # Save Excel permanently on render
+    file.get_file().download(EXCEL_FILE)
     update.message.reply_text("✔ Excel uploaded successfully.\nNow send me PDF files!")
 
 
+# ---------------------------
+# PDF PROCESSING
+# ---------------------------
 def extract_rfi_info(pdf_path):
     try:
         with pdfplumber.open(pdf_path) as pdf:
-            text = "\n".join(page.extract_text() for page in pdf.pages)
+            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
 
-            rfi_number = None
-            description = None
+        rfi_number = None
+        description = None
 
-            for line in text.split("\n"):
-                if "RFI" in line or "Inspection Request" in line:
-                    description = line.strip()
-                if "Rev" in line:
-                    rfi_number = "".join(filter(str.isdigit, line))
+        for line in text.split("\n"):
+            line = line.strip()
 
-            return rfi_number, description
-    except:
+            if "Inspection Request" in line or "RFI" in line:
+                description = line
+
+            if "Rev" in line:
+                digits = "".join(filter(str.isdigit, line))
+                if digits:
+                    rfi_number = digits
+
+        return rfi_number, description
+
+    except Exception as e:
+        print("PDF ERROR:", e)
         return None, None
 
 
@@ -67,13 +86,14 @@ def handle_pdf(update, context):
         return
 
     file = update.message.document
-    if not file.file_name.endswith(".pdf"):
+
+    if not file.file_name.lower().endswith(".pdf"):
         update.message.reply_text("❌ Please upload a PDF file.")
         return
 
     update.message.reply_text("📄 Extracting information from PDF...")
 
-    # Save temp PDF
+    # Save PDF temporarily
     pdf_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     file.get_file().download(pdf_temp.name)
 
@@ -83,14 +103,11 @@ def handle_pdf(update, context):
         update.message.reply_text("❌ Could not extract RFI info from this PDF.")
         return
 
-    # Load Excel
+    # Load Excel and update it
     wb = openpyxl.load_workbook(EXCEL_FILE)
     ws = wb.active
 
-    # Append data
     ws.append([rfi_number, description])
-
-    # Save Excel
     wb.save(EXCEL_FILE)
 
     update.message.reply_text("✔ PDF processed and Excel updated!")
@@ -103,10 +120,12 @@ def webhook_route():
     return "OK", 200
 
 
-# Setup dispatcher
+# Dispatcher
 dispatcher = Dispatcher(bot, None, use_context=True)
 dispatcher.add_handler(CommandHandler("start", start))
-dispatcher.add_handler(MessageHandler(Filters.document.mime_type("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"), handle_excel))
+
+# Accept Excel using flexible MIME types
+dispatcher.add_handler(MessageHandler(Filters.document, handle_excel))
 dispatcher.add_handler(MessageHandler(Filters.document.mime_type("application/pdf"), handle_pdf))
 
 
@@ -118,6 +137,12 @@ def home():
 @app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
 def webhook_handler():
     return webhook_route()
+
+
+# Debug version route
+@app.route("/debug", methods=["GET"])
+def debug():
+    return "VERSION: FIXED-1.0", 200
 
 
 if __name__ == "__main__":
