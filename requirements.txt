@@ -1,5 +1,5 @@
 python-telegram-bot==13.15
 Flask==2.3.3
-pdfplumber
-openpyxl
-Werkzeug
+pdfplumber==0.11.8
+openpyxl==3.1.5
+pypdfium2==5.0.0
