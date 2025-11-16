@@ -1,149 +1,174 @@
 import os
-from flask import Flask, request
-from telegram import Bot, Update
-from telegram.ext import Dispatcher, MessageHandler, Filters, CommandHandler
-import pdfplumber
-import openpyxl
+import re
 import tempfile
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-bot = Bot(token=BOT_TOKEN)
+from flask import Flask, request
+from telegram import Bot, Update
+from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters
 
+import pdfplumber
+import openpyxl
+
+# --- Telegram bot setup ---
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("Environment variable BOT_TOKEN is missing")
+
+bot = Bot(BOT_TOKEN)
 app = Flask(__name__)
 
-# Permanent directory on Render
+
+# --- File storage paths ---
+
+# Render keeps /data between restarts on free tier
 UPLOAD_DIR = "/data"
-if not os.path.exists(UPLOAD_DIR):
-    os.makedirs(UPLOAD_DIR)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-EXCEL_FILE = os.path.join(UPLOAD_DIR, "excel.xlsx")
+EXCEL_FILE = os.path.join(UPLOAD_DIR, "rfi_log.xlsx")
 
+
+def log(*args):
+    """Print to logs immediately (visible in Render Logs)."""
+    print(*args, flush=True)
+
+
+# --- Handlers ---
 
 def start(update, context):
     update.message.reply_text(
         "Welcome! 👋\n\n"
-        "1️⃣ Upload your Excel file first.\n"
-        "2️⃣ Then upload your PDF RFI files.\n"
-        "I will update Excel automatically."
+        "1️⃣ Upload your *Excel* file first (.xlsx).\n"
+        "2️⃣ Then upload your *PDF RFI* files.\n"
+        "I will extract info and update the Excel file automatically.",
+        parse_mode="Markdown",
     )
 
 
-# ---------------------------
-# FIXED EXCEL FILE HANDLER
-# ---------------------------
-def handle_excel(update, context):
-    file = update.message.document
-    file_name = file.file_name.lower()
-
-    # Accept ALL Excel MIME types coming from Telegram
-    allowed_excel = [
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "application/octet-stream",
-        "application/vnd.ms-excel",
-    ]
-
-    if file.mime_type not in allowed_excel or not file_name.endswith(".xlsx"):
-        update.message.reply_text("❌ Please upload a valid Excel (.xlsx) file.")
-        return
-
-    # Save Excel permanently on render
-    file.get_file().download(EXCEL_FILE)
+def save_excel(doc, update):
+    """Download and save the Excel file permanently."""
+    doc.get_file().download(EXCEL_FILE)
+    log(f"Saved Excel to {EXCEL_FILE}")
     update.message.reply_text("✔ Excel uploaded successfully.\nNow send me PDF files!")
 
 
-# ---------------------------
-# PDF PROCESSING
-# ---------------------------
-def extract_rfi_info(pdf_path):
+def extract_rfi_info_from_pdf(pdf_path, filename):
+    """
+    Extract RFI number and description from the PDF.
+
+    - RFI number: first group of digits in the filename
+      e.g. WIR-CIV-OHTL-855 Rev.00.pdf -> 855
+    - Description: first line containing 'Inspection Request' or 'RFI'
+    """
+    rfi_number = None
+    m = re.search(r"(\d+)", filename)
+    if m:
+        rfi_number = m.group(1)
+
+    description = None
     try:
         with pdfplumber.open(pdf_path) as pdf:
-            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+            texts = []
+            for page in pdf.pages:
+                t = page.extract_text()
+                if t:
+                    texts.append(t)
+            full_text = "\n".join(texts)
 
-        rfi_number = None
-        description = None
-
-        for line in text.split("\n"):
-            line = line.strip()
-
+        for line in full_text.splitlines():
             if "Inspection Request" in line or "RFI" in line:
-                description = line
-
-            if "Rev" in line:
-                digits = "".join(filter(str.isdigit, line))
-                if digits:
-                    rfi_number = digits
-
-        return rfi_number, description
-
+                description = line.strip()
+                break
     except Exception as e:
-        print("PDF ERROR:", e)
-        return None, None
+        log("Error reading PDF:", e)
+
+    return rfi_number, description
 
 
-def handle_pdf(update, context):
-    if not os.path.exists(EXCEL_FILE):
-        update.message.reply_text("❌ Please upload Excel first!")
+def handle_document(update, context):
+    """Handle ANY document (Excel or PDF). Decide by file extension."""
+    if not update.message or not update.message.document:
         return
 
-    file = update.message.document
+    doc = update.message.document
+    fname = (doc.file_name or "").lower()
+    log("Received document:", fname)
 
-    if not file.file_name.lower().endswith(".pdf"):
-        update.message.reply_text("❌ Please upload a PDF file.")
+    # 1) Excel files
+    if fname.endswith((".xlsx", ".xlsm", ".xls")):
+        save_excel(doc, update)
         return
 
-    update.message.reply_text("📄 Extracting information from PDF...")
+    # 2) PDF files
+    if fname.endswith(".pdf"):
+        if not os.path.exists(EXCEL_FILE):
+            update.message.reply_text(
+                "❌ Please upload the Excel file first, then send PDFs."
+            )
+            return
 
-    # Save PDF temporarily
-    pdf_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    file.get_file().download(pdf_temp.name)
+        update.message.reply_text("📄 Extracting information from PDF...")
 
-    rfi_number, description = extract_rfi_info(pdf_temp.name)
+        # Save PDF temporarily
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        doc.get_file().download(tmp.name)
+        log("Saved temp PDF:", tmp.name)
 
-    if not rfi_number or not description:
-        update.message.reply_text("❌ Could not extract RFI info from this PDF.")
+        rfi_number, description = extract_rfi_info_from_pdf(tmp.name, fname)
+
+        if not (rfi_number and description):
+            update.message.reply_text(
+                "❌ I couldn't extract RFI info from this PDF."
+            )
+            return
+
+        # Update Excel
+        try:
+            wb = openpyxl.load_workbook(EXCEL_FILE)
+            sheet = wb.active
+            sheet.append([rfi_number, description])
+            wb.save(EXCEL_FILE)
+            log("Excel updated with:", rfi_number, description)
+        except Exception as e:
+            log("Error updating Excel:", e)
+            update.message.reply_text(
+                "⚠ An error happened while updating the Excel file."
+            )
+            return
+
+        update.message.reply_text("✔ PDF processed and Excel updated!")
         return
 
-    # Load Excel and update it
-    wb = openpyxl.load_workbook(EXCEL_FILE)
-    ws = wb.active
-
-    ws.append([rfi_number, description])
-    wb.save(EXCEL_FILE)
-
-    update.message.reply_text("✔ PDF processed and Excel updated!")
+    # 3) Any other document type
+    update.message.reply_text(
+        "❌ Please send either an Excel (.xlsx) file or a PDF file."
+    )
 
 
-def webhook_route():
+# --- Dispatcher setup (python-telegram-bot) ---
+
+dispatcher = Dispatcher(bot, None, workers=0, use_context=True)
+dispatcher.add_handler(CommandHandler("start", start))
+dispatcher.add_handler(MessageHandler(Filters.document, handle_document))
+
+
+# --- Flask routes ---
+
+@app.route("/", methods=["GET"])
+def index():
+    return "Bot is running!", 200
+
+
+@app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
+def webhook():
+    """Telegram will POST updates here."""
     if request.method == "POST":
-        update = Update.de_json(request.json, bot)
+        update = Update.de_json(request.get_json(force=True), bot)
         dispatcher.process_update(update)
     return "OK", 200
 
 
-# Dispatcher
-dispatcher = Dispatcher(bot, None, use_context=True)
-dispatcher.add_handler(CommandHandler("start", start))
-
-# Accept Excel using flexible MIME types
-dispatcher.add_handler(MessageHandler(Filters.document, handle_excel))
-dispatcher.add_handler(MessageHandler(Filters.document.mime_type("application/pdf"), handle_pdf))
-
-
-@app.route("/", methods=["GET"])
-def home():
-    return "Bot is running!"
-
-
-@app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
-def webhook_handler():
-    return webhook_route()
-
-
-# Debug version route
-@app.route("/debug", methods=["GET"])
-def debug():
-    return "VERSION: FIXED-1.0", 200
-
+# --- Local run (not used on Render, but useful for debugging) ---
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
