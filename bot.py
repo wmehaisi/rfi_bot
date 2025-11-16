@@ -1,166 +1,125 @@
 import os
-import logging
 from flask import Flask, request
-from telegram import Update
-from telegram.ext import Dispatcher, MessageHandler, Filters, CallbackContext, CommandHandler
+from telegram import Bot, Update
+from telegram.ext import Dispatcher, MessageHandler, Filters, CommandHandler
 import pdfplumber
 import openpyxl
-from werkzeug.utils import secure_filename
+import tempfile
 
-# Logging
-logging.basicConfig(level=logging.INFO)
-
-TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+bot = Bot(token=BOT_TOKEN)
 
 app = Flask(__name__)
 
-# ================= TELEGRAM DISPATCHER =====================
-from telegram import Bot
-bot = Bot(token=TOKEN)
-dispatcher = Dispatcher(bot, None, workers=0)
+# Permanent directory
+UPLOAD_DIR = "/app/uploads"
+if not os.path.exists(UPLOAD_DIR):
+    os.makedirs(UPLOAD_DIR)
 
-# ============================================================
-# =================== BOT COMMANDS ===========================
-# ============================================================
+EXCEL_FILE = os.path.join(UPLOAD_DIR, "excel.xlsx")
 
-def start(update: Update, context: CallbackContext):
+
+def start(update, context):
     update.message.reply_text(
         "Welcome! 👋\n\n"
         "1️⃣ Upload your Excel file first.\n"
-        "2️⃣ Then upload any number of PDF RFI files.\n"
-        "I will extract info and update Excel automatically."
+        "2️⃣ Then upload your PDF RFI files.\n"
+        "I will update Excel automatically."
     )
 
-dispatcher.add_handler(CommandHandler("start", start))
 
+def handle_excel(update, context):
+    file = update.message.document
 
-# ============================================================
-# ============== HANDLE EXCEL UPLOAD =========================
-# ============================================================
-
-EXCEL_PATH = "main.xlsx"
-
-def handle_excel(update: Update, context: CallbackContext):
-    file = update.message.document.get_file()
-    filename = secure_filename(update.message.document.file_name)
-
-    if not filename.endswith(".xlsx"):
-        update.message.reply_text("❌ Please upload a valid Excel (.xlsx) file")
+    if not file.file_name.endswith(".xlsx"):
+        update.message.reply_text("❌ Please upload a valid Excel (.xlsx) file.")
         return
 
-    file.download(EXCEL_PATH)
+    # Save Excel permanently
+    file_path = EXCEL_FILE
+    file.get_file().download(file_path)
+
     update.message.reply_text("✔ Excel uploaded successfully.\nNow send me PDF files!")
 
-dispatcher.add_handler(MessageHandler(Filters.document.category("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"), handle_excel))
+
+def extract_rfi_info(pdf_path):
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            text = "\n".join(page.extract_text() for page in pdf.pages)
+
+            # Basic extraction example — adjust depending on PDF content
+            rfi_number = None
+            description = None
+
+            for line in text.split("\n"):
+                if "RFI" in line or "Inspection Request" in line:
+                    description = line.strip()
+                if "Rev" in line:
+                    rfi_number = "".join(filter(str.isdigit, line))
+
+            return rfi_number, description
+    except:
+        return None, None
 
 
-# ============================================================
-# ============== HANDLE PDF UPLOAD ===========================
-# ============================================================
-
-def extract_from_pdf(pdf_path):
-    """Extract RFI number, description, date, location, drawing number"""
-    data = {
-        "rfi_no": "",
-        "description": "",
-        "date": "",
-        "location": "",
-        "drawing": "",
-    }
-
-    with pdfplumber.open(pdf_path) as pdf:
-        text = ""
-        for page in pdf.pages:
-            text += page.extract_text() + "\n"
-
-    # RFI number from filename
-    base = os.path.basename(pdf_path)
-    parts = base.split("-")
-    data["rfi_no"] = parts[-1].replace("Rev.00.pdf", "").strip()
-
-    # crude extraction (you can customize patterns as needed)
-    lines = text.split("\n")
-    for line in lines:
-        if "Inspection Request" in line:
-            data["description"] = line.strip()
-
-        if "Tower" in line:
-            data["location"] = line.strip()
-
-        if "/" in line and "-" in line:
-            data["date"] = line.strip()
-
-        if "DWG" in line or "Drawing" in line:
-            data["drawing"] = line.strip()
-
-    return data
-
-
-def handle_pdf(update: Update, context: CallbackContext):
-    if not os.path.exists(EXCEL_PATH):
+def handle_pdf(update, context):
+    if not os.path.exists(EXCEL_FILE):
         update.message.reply_text("❌ Please upload Excel first!")
         return
 
-    file = update.message.document.get_file()
-    filename = secure_filename(update.message.document.file_name)
-    pdf_path = f"input/{filename}"
-
-    os.makedirs("input", exist_ok=True)
-    file.download(pdf_path)
+    file = update.message.document
+    if not file.file_name.endswith(".pdf"):
+        update.message.reply_text("❌ Please upload a PDF file.")
+        return
 
     update.message.reply_text("📄 Extracting information from PDF...")
 
-    info = extract_from_pdf(pdf_path)
+    # Save temp PDF
+    pdf_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    file.get_file().download(pdf_temp.name)
 
-    # Update Excel
-    wb = openpyxl.load_workbook(EXCEL_PATH)
+    rfi_number, description = extract_rfi_info(pdf_temp.name)
+
+    if not rfi_number or not description:
+        update.message.reply_text("❌ Could not extract RFI info from this PDF.")
+        return
+
+    # Load Excel
+    wb = openpyxl.load_workbook(EXCEL_FILE)
     ws = wb.active
 
-    next_row = ws.max_row + 1
-    ws[f"A{next_row}"] = info["rfi_no"]
-    ws[f"B{next_row}"] = info["description"]
-    ws[f"C{next_row}"] = info["date"]
-    ws[f"D{next_row}"] = info["location"]
-    ws[f"E{next_row}"] = info["drawing"]
+    # Append data
+    ws.append([rfi_number, description])
 
-    # Sort Excel by RFI number
-    rows = list(ws.iter_rows(values_only=True))
-    header = rows[0]
-    body = rows[1:]
+    # Save Excel
+    wb.save(EXCEL_FILE)
 
-    body_sorted = sorted(body, key=lambda x: int(x[0]))
-
-    ws.delete_rows(1, ws.max_row)
-    ws.append(header)
-    for r in body_sorted:
-        ws.append(r)
-
-    wb.save(EXCEL_PATH)
-
-    update.message.reply_text(
-        f"✔ RFI {info['rfi_no']} added!\nSend more PDFs or type /start."
-    )
-
-dispatcher.add_handler(MessageHandler(Filters.document.pdf, handle_pdf))
+    update.message.reply_text("✔ PDF processed and Excel updated!")
 
 
-# ============================================================
-# ================== WEBHOOK HANDLER =========================
-# ============================================================
-
-@app.route(f"/webhook/{TOKEN}", methods=["POST"])
-def webhook():
-    update = Update.de_json(request.get_json(force=True), bot)
-    dispatcher.process_update(update)
+def webhook(request):
+    if request.method == "POST":
+        update = Update.de_json(request.json, bot)
+        dispatcher.process_update(update)
     return "OK", 200
+
+
+# Setup dispatcher
+dispatcher = Dispatcher(bot, None, use_context=True)
+dispatcher.add_handler(CommandHandler("start", start))
+dispatcher.add_handler(MessageHandler(Filters.document.mime_type("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"), handle_excel))
+dispatcher.add_handler(MessageHandler(Filters.document.mime_type("application/pdf"), handle_pdf))
 
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Bot running successfully!", 200
+    return "Bot is running!"
 
 
-# ============================================================
+@app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
+def webhook_handler():
+    return webhook(request)
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
