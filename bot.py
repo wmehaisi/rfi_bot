@@ -11,8 +11,8 @@ bot = Bot(token=BOT_TOKEN)
 
 app = Flask(__name__)
 
-# Permanent directory
-UPLOAD_DIR = "/app/uploads"
+# Permanent Render-safe directory
+UPLOAD_DIR = "/data"
 if not os.path.exists(UPLOAD_DIR):
     os.makedirs(UPLOAD_DIR)
 
@@ -35,7 +35,7 @@ def handle_excel(update, context):
         update.message.reply_text("❌ Please upload a valid Excel (.xlsx) file.")
         return
 
-    # Save Excel permanently
+    # Save Excel permanently (this directory survives restarts!)
     file_path = EXCEL_FILE
     file.get_file().download(file_path)
 
@@ -47,7 +47,6 @@ def extract_rfi_info(pdf_path):
         with pdfplumber.open(pdf_path) as pdf:
             text = "\n".join(page.extract_text() for page in pdf.pages)
 
-            # Basic extraction example — adjust depending on PDF content
             rfi_number = None
             description = None
 
@@ -97,7 +96,7 @@ def handle_pdf(update, context):
     update.message.reply_text("✔ PDF processed and Excel updated!")
 
 
-def webhook(request):
+def webhook_route():
     if request.method == "POST":
         update = Update.de_json(request.json, bot)
         dispatcher.process_update(update)
@@ -118,7 +117,7 @@ def home():
 
 @app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
 def webhook_handler():
-    return webhook(request)
+    return webhook_route()
 
 
 if __name__ == "__main__":
